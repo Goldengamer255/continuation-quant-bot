@@ -91,6 +91,54 @@ MODEL_FEATURES: tuple[str, ...] = (
     "ema_spread_atr",
 )
 
+# ---- Optional feature groups ------------------------------------------------
+# The base set above is built only from one symbol's own candles. These groups
+# add *different information*, each switched on by a FeatureConfig flag:
+#
+# * Order flow - who was the aggressor. "Taker buy volume" is volume where
+#   the buyer crossed the spread. An impulse driven by aggressive buying, and
+#   a pause where sellers are not hitting bids, is a different animal from the
+#   same candle shapes produced by passive flow.
+# * Market context - crypto is highly correlated. A long setup on an altcoin
+#   while BTC is breaking down is fighting the tide.
+# * Regime - very long trend, whether volatility is high or low relative to
+#   its own history, and time of day/week (liquidity differs by session).
+ORDER_FLOW_FEATURES: tuple[str, ...] = (
+    "cons_flow_imbalance",
+    "impulse_flow_imbalance",
+    "trade_size_ratio",
+)
+CONTEXT_FEATURES: tuple[str, ...] = (
+    "ctx_roc",
+    "ctx_ema_spread_atr",
+    "rel_strength",
+    "ctx_atr_compression",
+)
+REGIME_FEATURES: tuple[str, ...] = ("trend_long_atr", "vol_regime", "hour", "day_of_week")
+ALL_FEATURES: tuple[str, ...] = (
+    MODEL_FEATURES + ORDER_FLOW_FEATURES + CONTEXT_FEATURES + REGIME_FEATURES
+)
+ALL_SIGNED_FEATURES: tuple[str, ...] = SIGNED_FEATURES + (
+    "cons_flow_imbalance",
+    "impulse_flow_imbalance",
+    "ctx_roc",
+    "ctx_ema_spread_atr",
+    "rel_strength",
+    "trend_long_atr",
+)
+
+
+def feature_columns(cfg: FeatureConfig) -> list[str]:
+    """The ordered model input columns for a given feature configuration."""
+    cols = list(MODEL_FEATURES)
+    if cfg.use_order_flow:
+        cols += ORDER_FLOW_FEATURES
+    if cfg.use_market_context:
+        cols += CONTEXT_FEATURES
+    if cfg.use_regime:
+        cols += REGIME_FEATURES
+    return cols
+
 
 # ---------------------------------------------------------------------------
 # Indicator building blocks
@@ -137,8 +185,15 @@ def rolling_slope(series: pd.Series, window: int) -> pd.Series:
 # ---------------------------------------------------------------------------
 # Feature computation
 # ---------------------------------------------------------------------------
-def compute_features(df: pd.DataFrame, cfg: FeatureConfig) -> pd.DataFrame:
+def compute_features(
+    df: pd.DataFrame, cfg: FeatureConfig, context: pd.DataFrame | None = None
+) -> pd.DataFrame:
     """Compute per-bar features from OHLCV. Row *t* uses bars ``<= t`` only.
+
+    ``context`` is the OHLCV frame of ``cfg.context_symbol`` and is required
+    when ``cfg.use_market_context`` is on. It is aligned on timestamp, and a
+    context bar with the same timestamp closes at the same instant, so no
+    future information crosses over.
 
     Window geometry at bar *t* (C = consolidation_window, I = impulse_window)::
 
@@ -209,6 +264,49 @@ def compute_features(df: pd.DataFrame, cfg: FeatureConfig) -> pd.DataFrame:
     out["ema_slow_dist_atr"] = (close - ema_slow) / atr_main
     out["ema_spread_atr"] = (ema_fast - ema_slow) / atr_main
 
+    # ---- Optional: order flow -----------------------------------------------
+    if cfg.use_order_flow:
+        taker_buy = df["taker_buy_volume"]
+        # Imbalance in [-1, +1]: +1 = every trade was an aggressive buy.
+        out["cons_flow_imbalance"] = (
+            2.0 * taker_buy.rolling(n_cons).sum() / volume.rolling(n_cons).sum() - 1.0
+        )
+        out["impulse_flow_imbalance"] = (
+            2.0
+            * taker_buy.shift(n_cons).rolling(n_imp).sum()
+            / volume.shift(n_cons).rolling(n_imp).sum()
+            - 1.0
+        )
+        # Average trade size in the pause vs the impulse: are large players still active?
+        trade_size = volume / df["trades"]
+        out["trade_size_ratio"] = (
+            trade_size.rolling(n_cons).mean() / trade_size.shift(n_cons).rolling(n_imp).mean()
+        )
+
+    # ---- Optional: market context -------------------------------------------
+    if cfg.use_market_context:
+        if context is None:
+            raise ValueError("use_market_context is on but no context bars were supplied")
+        ctx_close = context["close"]
+        # Indicators are computed on the context's own index, then aligned.
+        ctx_roc = (ctx_close / ctx_close.shift(n_imp) - 1.0).reindex(df.index)
+        ctx_spread = (ema(ctx_close, cfg.ema_fast) - ema(ctx_close, cfg.ema_slow)) / atr(
+            context, cfg.atr_window
+        )
+        ctx_compression = atr(context, cfg.atr_short_window) / atr(context, cfg.atr_long_window)
+        out["ctx_roc"] = ctx_roc
+        out["ctx_ema_spread_atr"] = ctx_spread.reindex(df.index)
+        out["rel_strength"] = out["roc_n"] - ctx_roc  # outperforming the market?
+        out["ctx_atr_compression"] = ctx_compression.reindex(df.index)
+
+    # ---- Optional: regime ---------------------------------------------------
+    if cfg.use_regime:
+        out["trend_long_atr"] = (close - ema(close, cfg.trend_long_span)) / atr_main
+        atr_pct = atr_main / close
+        out["vol_regime"] = atr_pct / atr_pct.rolling(cfg.vol_regime_lookback).mean()
+        out["hour"] = df.index.hour.astype(float)
+        out["day_of_week"] = df.index.day_of_week.astype(float)
+
     # Division by zero (e.g. a zero-volume window) becomes NaN, and NaN rows
     # are never treated as setups.
     return out.replace([np.inf, -np.inf], np.nan)
@@ -253,8 +351,15 @@ def detect_setups(features: pd.DataFrame, cfg: SetupConfig) -> pd.DataFrame:
     if cfg.allow_short:
         side[short_setup] = -1
 
+    # Volatility-regime filter. Quiet markets tend to be followed by volatility
+    # *expansion*; a breakout that starts from a quiet base has room to travel
+    # several (small) ATRs. In an already-wild market the same pattern is
+    # mostly noise. Uses ATR and close as of this bar only.
+    if cfg.max_atr_pct is not None:
+        side[(f["atr"] / f["close"]) > cfg.max_atr_pct] = 0
+
     # Require every raw input to be present (drops the warm-up period).
-    raw_cols = [c for c in MODEL_FEATURES if c in f.columns]
+    raw_cols = [c for c in ALL_FEATURES if c in f.columns]
     complete = f[raw_cols + ["atr", "cons_high", "cons_low"]].notna().all(axis=1)
 
     mask = (side != 0) & complete
@@ -281,11 +386,12 @@ def build_feature_matrix(features: pd.DataFrame, events: pd.DataFrame) -> pd.Dat
     is_long = side > 0
 
     x = pd.DataFrame(index=events.index)
-    for col in MODEL_FEATURES:
+    for col in ALL_FEATURES:
         if col in rows.columns:
             x[col] = rows[col].to_numpy()
-    for col in SIGNED_FEATURES:
-        x[col] = x[col] * side
+    for col in ALL_SIGNED_FEATURES:
+        if col in x.columns:
+            x[col] = x[col] * side
 
     move_abs = rows["impulse_move"].abs().to_numpy()
     cons_high, cons_low = rows["cons_high"].to_numpy(), rows["cons_low"].to_numpy()
@@ -300,4 +406,4 @@ def build_feature_matrix(features: pd.DataFrame, events: pd.DataFrame) -> pd.Dat
     pos = (rows["close"].to_numpy() - cons_low) / (cons_high - cons_low)
     x["close_pos_in_range"] = np.where(is_long, pos, 1.0 - pos)
 
-    return x[list(MODEL_FEATURES)]
+    return x[[c for c in ALL_FEATURES if c in x.columns]]

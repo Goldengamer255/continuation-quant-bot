@@ -71,7 +71,7 @@ from sklearn.metrics import log_loss, precision_score, recall_score, roc_auc_sco
 
 from core.config import Settings, load_settings, resolve_path
 from research.dataset import build_dataset
-from research.features import MODEL_FEATURES
+from research.features import feature_columns
 
 logger = logging.getLogger(__name__)
 
@@ -213,7 +213,7 @@ def walk_forward_validate(dataset: pd.DataFrame, settings: Settings) -> WalkForw
     """
     cfg = settings.model
     ds = dataset.reset_index(drop=True)
-    features = list(MODEL_FEATURES)
+    features = feature_columns(settings.features)
     has_label = ds["label"].notna().to_numpy()
 
     splitter = PurgedWalkForwardSplit(
@@ -297,7 +297,7 @@ def train_final_model(dataset: pd.DataFrame, settings: Settings):
     """
     labelled = dataset[dataset["label"].notna()]
     return fit_model(
-        labelled[list(MODEL_FEATURES)],
+        labelled[feature_columns(settings.features)],
         labelled["label"].astype(int),
         labelled["weight"],
         settings.model.lgbm_params,
@@ -312,7 +312,7 @@ def save_model(model, settings: Settings, n_samples: int) -> None:
     meta = {
         "trained_at": datetime.now(UTC).isoformat(timespec="seconds"),
         "n_samples": n_samples,
-        "features": list(MODEL_FEATURES),
+        "features": feature_columns(settings.features),
         "signature": settings.signature(),
     }
     (weights_dir / META_FILE).write_text(json.dumps(meta, indent=2), encoding="utf-8")
@@ -329,7 +329,7 @@ def load_model(settings: Settings):
     if not model_path.exists() or not meta_path.exists():
         raise FileNotFoundError("No trained model found. Run `python -m research.train` first.")
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    if meta["features"] != list(MODEL_FEATURES):
+    if meta["features"] != feature_columns(settings.features):
         raise RuntimeError("Model feature list does not match the current code. Retrain.")
     if meta["signature"] != json.loads(json.dumps(settings.signature())):
         raise RuntimeError("Model was trained with different feature/label settings. Retrain.")

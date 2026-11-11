@@ -150,3 +150,16 @@ def test_sharpe_and_sortino():
     # Sortino ignores upside volatility, so it is the larger of the two here.
     assert sortino_ratio(returns, 365) > sharpe_ratio(returns, 365)
     assert np.isnan(sharpe_ratio(pd.Series([0.01, 0.01]), 365))
+
+
+def test_funding_is_charged_to_longs_pro_rata(settings):
+    with_funding = settings.model_copy(
+        update={"costs": settings.costs.model_copy(update={"funding_rate_8h": 0.0001})}
+    )
+    signals = frame(signal(0, "pt", hold=8))
+    base_trade = run_backtest(signals, settings).trades.iloc[0]
+    funded = run_backtest(signals, with_funding).trades.iloc[0]
+    # Entry at hour 1, exit at hour 9, plus the exit bar itself = 9 hours held.
+    expected = funded["qty"] * funded["entry_fill"] * 0.0001 * 9 / 8
+    assert funded["fees"] - base_trade["fees"] == pytest.approx(expected)
+    assert funded["net_pnl"] < base_trade["net_pnl"]

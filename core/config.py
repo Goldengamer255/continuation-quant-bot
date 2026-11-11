@@ -83,6 +83,13 @@ class FeatureConfig(_Section):
     bb_squeeze_lookback: int = Field(100, ge=10)
     ema_fast: int = Field(20, ge=2)
     ema_slow: int = Field(50, ge=3)
+    # Optional feature groups (research-only until validated; see features.py).
+    use_order_flow: bool = False  # needs taker-buy volume and trade counts (Binance klines)
+    use_market_context: bool = False  # needs bars for the context symbol
+    use_regime: bool = False
+    context_symbol: str = "BTC/USDT"
+    trend_long_span: int = Field(200, ge=20)
+    vol_regime_lookback: int = Field(300, ge=20)
 
     @model_validator(mode="after")
     def _check_windows(self) -> FeatureConfig:
@@ -98,6 +105,9 @@ class SetupConfig(_Section):
     max_consolidation_range_atr: float = Field(2.0, gt=0)
     max_retrace: float = Field(0.5, gt=0, le=1.0)
     allow_short: bool = False
+    # Optional volatility-regime filter: only take setups while ATR / price is
+    # at or below this fraction (e.g. 0.0107 = 1.07%). None disables it.
+    max_atr_pct: float | None = Field(None, gt=0)
 
 
 class LabelingConfig(_Section):
@@ -124,6 +134,10 @@ class CostConfig(_Section):
     taker_fee: float = Field(0.001, ge=0, lt=0.05)
     maker_fee: float = Field(0.001, ge=-0.01, lt=0.05)  # maker rebates can be negative
     slippage_bps: float = Field(5.0, ge=0, lt=500)
+    # Perpetual-futures funding: the fraction of position notional a LONG pays
+    # every 8 hours (shorts receive it). 0 for spot. Real funding varies and can
+    # flip sign; a constant is a deliberately simple, long-unfriendly estimate.
+    funding_rate_8h: float = Field(0.0, ge=-0.01, le=0.01)
 
     @property
     def slippage(self) -> float:

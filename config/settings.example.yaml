@@ -33,6 +33,14 @@ features:
   bb_squeeze_lookback: 100   # history that "normal" Bollinger width is measured over
   ema_fast: 20
   ema_slow: 50
+  # Optional feature groups. Research-only: the live engine refuses to start
+  # with any of them enabled until its data feed supplies the extra inputs.
+  use_order_flow: false      # taker-buy imbalance, trade size (Binance klines only)
+  use_market_context: false  # trend and relative strength vs context_symbol
+  use_regime: false          # long trend, volatility regime, time of day/week
+  context_symbol: "BTC/USDT"
+  trend_long_span: 200
+  vol_regime_lookback: 300
 
 setup:
   # Rule-based candidate filter. The ML model only scores bars that already
@@ -41,6 +49,7 @@ setup:
   max_consolidation_range_atr: 2.0 # consolidation high-low must be <= this many ATRs
   max_retrace: 0.5                 # consolidation may give back <= 50% of the impulse
   allow_short: false               # requires market.type: swap
+  max_atr_pct: null                # e.g. 0.0107 = only trade while ATR/price <= 1.07%
 
 labeling:
   profit_target_atr: 2.0     # upper barrier
@@ -79,6 +88,7 @@ costs:
   taker_fee: 0.001           # 0.10% per side, paid on stop-triggered entries and stop/time exits
   maker_fee: 0.001           # paid on resting take-profit limit orders
   slippage_bps: 5            # adverse slippage applied to every taker fill
+  funding_rate_8h: 0.0       # perpetual futures only: fraction of notional a long pays per 8h
 
 backtest:
   initial_equity: 10000

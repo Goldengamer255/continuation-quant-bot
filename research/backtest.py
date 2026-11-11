@@ -33,7 +33,8 @@ Known simplifications (state these before an interviewer finds them)
   drawdown, and the simulated kill-switch reacts to realised losses only.
 * Slippage is a constant number of basis points. Real slippage grows with
   order size and during breakouts (precisely when this strategy trades).
-* No funding costs, no partial fills, no exchange outages.
+* Funding is a constant rate (``costs.funding_rate_8h``), not the real,
+  time-varying series; no partial fills, no exchange outages.
 
 Metrics primer
 --------------
@@ -133,6 +134,7 @@ def run_backtest(
     """
     threshold = settings.model.probability_threshold if threshold is None else threshold
     costs, lab = settings.costs, settings.labeling
+    bar_td = settings.bar_timedelta
     slip = costs.slippage
 
     signals = signals.sort_values("time", kind="stable")
@@ -195,6 +197,9 @@ def run_backtest(
         else:
             exit_fill, exit_fee_rate = row.exit_price * (1.0 - side * slip), costs.taker_fee
         fees = qty * entry_fill * costs.taker_fee + qty * exit_fill * exit_fee_rate
+        # Funding (perpetual futures): longs pay, shorts receive, pro rata to time held.
+        hours_held = (row.exit_time - row.entry_time + bar_td) / pd.Timedelta(hours=1)
+        fees += side * qty * entry_fill * costs.funding_rate_8h * hours_held / 8.0
         gross_pnl = side * qty * (row.exit_price - row.entry_price)
         net_pnl = side * qty * (exit_fill - entry_fill) - fees
         risk_amount = qty * lab.stop_loss_atr * row.atr

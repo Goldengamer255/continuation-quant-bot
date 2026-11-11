@@ -151,6 +151,15 @@ class TradingEngine:
         risk: RiskManager,
         model,
     ) -> None:
+        f = settings.features
+        if f.use_order_flow or f.use_market_context or f.use_regime:
+            # The live feed only supplies plain OHLCV for the traded symbols.
+            # Running a model trained on extra inputs without them would be
+            # train/serve skew, so refuse rather than improvise.
+            raise NotImplementedError(
+                "Optional feature groups are research-only: the live engine does not "
+                "yet supply order-flow or context data."
+            )
         self.settings = settings
         self.feed = feed
         self.broker = broker

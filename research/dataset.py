@@ -19,9 +19,11 @@ from research.features import build_feature_matrix, compute_features, detect_set
 from research.labeling import FILLED_OUTCOMES, apply_triple_barrier, average_uniqueness
 
 
-def build_symbol_dataset(symbol: str, bars: pd.DataFrame, settings: Settings) -> pd.DataFrame:
+def build_symbol_dataset(
+    symbol: str, bars: pd.DataFrame, settings: Settings, context: pd.DataFrame | None = None
+) -> pd.DataFrame:
     """Build the labelled setup table for one symbol."""
-    features = compute_features(bars, settings.features)
+    features = compute_features(bars, settings.features, context=context)
     events = detect_setups(features, settings.setup)
     labels = apply_triple_barrier(bars, events, settings.labeling)
     if labels.empty:
@@ -48,7 +50,14 @@ def build_symbol_dataset(symbol: str, bars: pd.DataFrame, settings: Settings) ->
 
 def build_dataset(bars_by_symbol: dict[str, pd.DataFrame], settings: Settings) -> pd.DataFrame:
     """Pool all symbols into one chronologically sorted dataset."""
-    parts = [build_symbol_dataset(sym, bars, settings) for sym, bars in bars_by_symbol.items()]
+    context = None
+    if settings.features.use_market_context:
+        if settings.features.context_symbol not in bars_by_symbol:
+            raise ValueError(f"context symbol {settings.features.context_symbol} has no bars")
+        context = bars_by_symbol[settings.features.context_symbol]
+    parts = [
+        build_symbol_dataset(sym, bars, settings, context) for sym, bars in bars_by_symbol.items()
+    ]
     parts = [p for p in parts if not p.empty]
     if not parts:
         raise ValueError("No setups found. Loosen the `setup` thresholds or add more history.")

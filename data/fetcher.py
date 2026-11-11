@@ -41,6 +41,9 @@ from core.config import Settings, load_settings, resolve_path, timeframe_to_time
 logger = logging.getLogger(__name__)
 
 OHLCV_COLUMNS = ["open", "high", "low", "close", "volume"]
+# Extra per-bar fields from Binance's raw kline endpoint (not in CCXT's unified
+# OHLCV): volume bought by aggressive (taker) buyers, and the number of trades.
+FLOW_COLUMNS = ["taker_buy_volume", "trades"]
 
 
 def ohlcv_to_frame(rows: list[list[float]]) -> pd.DataFrame:
@@ -99,18 +102,26 @@ def fetch_ohlcv(
     until: pd.Timestamp | None = None,
     page_limit: int = 1000,
     max_retries: int = 5,
+    with_flow: bool = False,
 ) -> pd.DataFrame:
-    """Download closed bars in ``[since, until)`` by paginating the exchange API."""
+    """Download closed bars in ``[since, until)`` by paginating the exchange API.
+
+    ``with_flow`` adds ``FLOW_COLUMNS`` (Binance only).
+    """
     import ccxt  # imported lazily so research code that only reads the cache has no network dep
 
     exchange = getattr(ccxt, exchange_id)({"enableRateLimit": True})
+    if with_flow:
+        if exchange_id != "binance":
+            raise ValueError("order-flow columns are only available from Binance klines")
+        exchange.load_markets()
     bar_ms = int(timeframe_to_timedelta(timeframe).total_seconds() * 1000)
     until = until if until is not None else pd.Timestamp.now(tz="UTC")
     cursor, end_ms = int(since.timestamp() * 1000), int(until.timestamp() * 1000)
 
     rows: list[list[float]] = []
     while cursor < end_ms:
-        batch = _fetch_page(exchange, symbol, timeframe, cursor, page_limit, max_retries)
+        batch = _fetch_page(exchange, symbol, timeframe, cursor, page_limit, max_retries, with_flow)
         if not batch:
             break
         rows.extend(batch)
@@ -121,17 +132,34 @@ def fetch_ohlcv(
 
     if not rows:
         raise RuntimeError(f"No OHLCV data returned for {symbol} on {exchange_id}")
-    df = ohlcv_to_frame(rows)
+    if with_flow:
+        df = pd.DataFrame(rows, columns=["timestamp", *OHLCV_COLUMNS, *FLOW_COLUMNS])
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+        df = df.set_index("timestamp").astype("float64")
+    else:
+        df = ohlcv_to_frame(rows)
     return validate_ohlcv(df[df.index < until], timeframe)
 
 
-def _fetch_page(exchange, symbol, timeframe, since_ms, limit, max_retries):
+def _fetch_page(exchange, symbol, timeframe, since_ms, limit, max_retries, with_flow=False):
     """One page with exponential backoff on transient network errors."""
     import ccxt
 
     for attempt in range(1, max_retries + 1):
         try:
-            return exchange.fetch_ohlcv(symbol, timeframe, since=since_ms, limit=limit)
+            if not with_flow:
+                return exchange.fetch_ohlcv(symbol, timeframe, since=since_ms, limit=limit)
+            # Raw kline layout: [open_time, o, h, l, c, volume, close_time,
+            # quote_volume, trades, taker_buy_base, taker_buy_quote, ignore]
+            raw = exchange.publicGetKlines(
+                {
+                    "symbol": exchange.market(symbol)["id"],
+                    "interval": timeframe,
+                    "startTime": since_ms,
+                    "limit": limit,
+                }
+            )
+            return [[int(k[0]), *(float(v) for v in k[1:6]), float(k[9]), float(k[8])] for k in raw]
         except ccxt.NetworkError as exc:  # includes rate-limit and timeout errors
             if attempt == max_retries:
                 raise
@@ -143,18 +171,36 @@ def _fetch_page(exchange, symbol, timeframe, since_ms, limit, max_retries):
 
 def cache_path(settings: Settings, symbol: str) -> Path:
     safe_symbol = symbol.replace("/", "-").replace(":", "_")
-    name = f"{settings.market.exchange}_{safe_symbol}_{settings.market.timeframe}.parquet"
+    suffix = "_flow" if settings.features.use_order_flow else ""
+    name = f"{settings.market.exchange}_{safe_symbol}_{settings.market.timeframe}{suffix}.parquet"
     return resolve_path(settings.data.cache_dir) / name
 
 
 def load_ohlcv(symbol: str, settings: Settings, refresh: bool = False) -> pd.DataFrame:
     """Return cached bars for ``symbol``, downloading them first if needed."""
     path = cache_path(settings, symbol)
+    requested_days = settings.data.history_days
     if path.exists() and not refresh:
-        return pd.read_parquet(path)
+        cached = pd.read_parquet(path)
+        span_days = (cached.index[-1] - cached.index[0]).days
+        if span_days < requested_days - 30:
+            # A cache written for a shorter history is silently reused otherwise.
+            logger.warning(
+                "%s cache spans %d days but %d were requested; pass refresh=True to extend",
+                symbol,
+                span_days,
+                requested_days,
+            )
+        return cached
 
-    since = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=settings.data.history_days)
-    df = fetch_ohlcv(settings.market.exchange, symbol, settings.market.timeframe, since)
+    since = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=requested_days)
+    df = fetch_ohlcv(
+        settings.market.exchange,
+        symbol,
+        settings.market.timeframe,
+        since,
+        with_flow=settings.features.use_order_flow,
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(path)
     logger.info("cached %d bars for %s at %s", len(df), symbol, path)
