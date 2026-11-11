@@ -1,0 +1,20 @@
+[project]
+name = "continuation-quant-bot"
+version = "0.1.0"
+description = "ML-filtered continuation trading system: research pipeline and live execution engine"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["venv", "artifacts", "models"]
+
+[tool.ruff.lint]
+# E/F: pycodestyle + pyflakes, I: import order, B: bugbear (likely bugs),
+# UP: modern syntax, SIM: simplifications.
+select = ["E", "F", "I", "B", "UP", "SIM"]

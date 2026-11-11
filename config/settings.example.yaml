@@ -1,0 +1,106 @@
+# =============================================================================
+# PUBLIC TEMPLATE — safe placeholder values only.
+#
+# Copy to config/settings.yaml (gitignored) and tune there:
+#   PowerShell:  Copy-Item config/settings.example.yaml config/settings.yaml
+#
+# Every key is validated by core/config.py (unknown keys are rejected, so a
+# typo fails loudly instead of silently falling back to a default).
+# The numbers below are textbook defaults, NOT a tuned edge.
+# =============================================================================
+
+market:
+  exchange: binance          # any ccxt exchange id
+  type: spot                 # spot | swap  (shorting requires swap)
+  symbols: ["BTC/USDT"]
+  timeframe: 1h
+  quote_currency: USDT
+  sandbox: true              # use the exchange testnet when trading live
+
+data:
+  cache_dir: data/cache      # gitignored parquet cache
+  history_days: 730
+
+features:
+  impulse_window: 12         # bars in the impulse leg (the "N" in N-bar ROC)
+  consolidation_window: 6    # bars in the pause that follows the impulse
+  volume_window: 50          # baseline for the relative-volume spike
+  atr_window: 14             # ATR used for barriers, sizing and normalisation
+  atr_short_window: 5        # numerator of the ATR compression ratio
+  atr_long_window: 50        # denominator of the ATR compression ratio
+  bb_window: 20
+  bb_std: 2.0
+  bb_squeeze_lookback: 100   # history that "normal" Bollinger width is measured over
+  ema_fast: 20
+  ema_slow: 50
+
+setup:
+  # Rule-based candidate filter. The ML model only scores bars that already
+  # look like impulse -> tight consolidation (this is "meta-labeling").
+  min_impulse_atr: 2.0             # impulse leg must travel >= this many ATRs
+  max_consolidation_range_atr: 2.0 # consolidation high-low must be <= this many ATRs
+  max_retrace: 0.5                 # consolidation may give back <= 50% of the impulse
+  allow_short: false               # requires market.type: swap
+
+labeling:
+  profit_target_atr: 2.0     # upper barrier
+  stop_loss_atr: 1.0         # lower barrier
+  max_holding_bars: 24       # vertical (time) barrier
+  entry_buffer_atr: 0.1      # stop trigger sits this far beyond the consolidation edge
+  limit_offset_atr: 0.25     # limit price sits this far beyond the trigger (max slippage accepted)
+  entry_valid_bars: 3        # unfilled entry order is cancelled after this many bars
+
+model:
+  # Break-even win rate for a 2:1 payoff is 1/3 before costs, so any
+  # threshold above ~0.40 already demands positive expectancy. Raising it
+  # trades frequency for selectivity. Do NOT tune this on out-of-sample
+  # results and then report those same results — that is threshold overfitting.
+  probability_threshold: 0.50
+  n_splits: 5
+  initial_train_fraction: 0.4
+  embargo_bars: 24
+  min_train_samples: 100
+  artifact_dir: artifacts
+  weights_dir: models
+  lgbm_params:
+    n_estimators: 300
+    learning_rate: 0.03
+    num_leaves: 15
+    max_depth: 4
+    min_child_samples: 30
+    subsample: 0.8
+    subsample_freq: 1
+    colsample_bytree: 0.8
+    reg_lambda: 5.0
+    random_state: 42
+    n_jobs: 1
+
+costs:
+  taker_fee: 0.001           # 0.10% per side, paid on stop-triggered entries and stop/time exits
+  maker_fee: 0.001           # paid on resting take-profit limit orders
+  slippage_bps: 5            # adverse slippage applied to every taker fill
+
+backtest:
+  initial_equity: 10000
+  periods_per_year: 365      # crypto trades every day; use 252 for equities
+
+risk:
+  risk_per_trade: 0.01       # fraction of equity lost if the stop is hit
+  max_daily_drawdown: 0.03   # kill-switch; code enforces a hard ceiling of 0.03
+  max_position_pct: 0.5      # single-position notional cap, as a fraction of equity
+  max_gross_exposure_pct: 1.0
+  max_open_positions: 3
+  max_consecutive_api_errors: 5
+  min_order_notional: 10
+  auto_resume_next_day: true # drawdown halt clears at the next UTC day; API-error halts never auto-clear
+
+execution:
+  mode: paper                # paper | live
+  warmup_bars: 600
+  reconcile_seconds: 5
+  flatten_on_shutdown: false # false = leave the exchange-side protective stop in place
+  cancel_orphans_on_start: true
+  max_retries: 5
+  retry_base_delay: 0.5
+  log_level: INFO
+  log_json: true

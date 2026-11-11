@@ -1,0 +1,65 @@
+# =============================================================================
+# SECRETS  — never commit credentials
+# =============================================================================
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# =============================================================================
+# LIVE EDGE — tuned strategy parameters and trained model weights stay local
+# =============================================================================
+# Only the *.example.yaml template is public. Any other YAML in config/ is
+# assumed to contain live-tuned parameters.
+config/*.yaml
+config/*.yml
+!config/settings.example.yaml
+
+# Model artifacts (weights + metadata describing the tuned feature config)
+models/*
+!models/.gitkeep
+*.pkl
+*.joblib
+*.lgb
+*.onnx
+
+# =============================================================================
+# DATA & RESEARCH OUTPUT — large, reproducible, and sometimes licence-restricted
+# =============================================================================
+data/cache/
+artifacts/
+*.parquet
+*.feather
+*.h5
+*.hdf5
+logs/
+*.log
+
+# =============================================================================
+# PYTHON
+# =============================================================================
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# =============================================================================
+# NOTEBOOKS / EDITORS / OS
+# =============================================================================
+.ipynb_checkpoints/
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
