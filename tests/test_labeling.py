@@ -58,6 +58,26 @@ def test_both_barriers_in_one_bar_is_scored_as_a_loss():
     assert path.outcome == "sl"
 
 
+def test_entry_bar_wick_before_the_fill_is_not_a_stop_out():
+    # Bar 1 dips to 98.5 (below the 99 stop) and then breaks out through 100.
+    # The dip happened before we were filled, so the trade is still alive.
+    path = run([SETUP_BAR, (99.8, 100.4, 98.5, 100.3), (100.3, 102.5, 100.2, 102.2)])
+    assert (path.outcome, path.entry_pos, path.exit_pos) == ("pt", 1, 2)
+
+
+def test_entry_bar_close_through_stop_is_a_stop_out():
+    # Bar 1 breaks out through 100 and then closes at 98.8: stopped after the fill.
+    path = run([SETUP_BAR, (99.8, 100.4, 98.5, 98.8), QUIET_BAR])
+    assert (path.outcome, path.exit_pos, path.exit_price) == ("sl", 1, 99.0)
+
+
+def test_entry_at_the_open_uses_the_full_bar_range():
+    # Bar 1 gaps to 100.2 (inside the limit), so we hold for the whole bar.
+    # Stop is 99.2; the low of 99.0 is a real stop-out even though it closes higher.
+    path = run([SETUP_BAR, (100.2, 100.4, 99.0, 100.1), QUIET_BAR])
+    assert (path.outcome, path.entry_price, path.exit_pos) == ("sl", 100.2, 1)
+
+
 def test_gap_through_stop_fills_at_the_worse_open():
     path = run([SETUP_BAR, (99.8, 100.4, 99.7, 100.3), (98.5, 98.8, 98.0, 98.2)])
     assert (path.outcome, path.exit_price) == ("sl", 98.5)

@@ -34,6 +34,14 @@ Design decisions
 * **Pessimistic intrabar assumption.** OHLC bars do not reveal the order of
   the high and the low. If one bar touches both the stop and the target, the
   stop is assumed to come first. Backtests should err against themselves.
+* **Entry-bar exception.** When the entry fills intrabar, the bar's adverse
+  extreme (the low, for a long) usually printed *before* the breakout, i.e.
+  before we held a position. Counting it as a stop-out would be wrong, and on
+  random-walk data it produced a large negative bias. On the entry bar a stop
+  is therefore only counted if the bar *closes* through the stop. This can
+  miss a genuine same-bar stop-out that recovered by the close; resolving
+  that exactly needs lower-timeframe data. Fills at the open are unaffected:
+  the whole bar is post-entry, so the full low/high is used.
 * **Gaps.** If price gaps through the stop, the fill is the (worse) open, not
   the stop price. Targets fill at the target (limit orders do not improve
   in this model — again conservative).
@@ -157,16 +165,25 @@ def simulate_trade(
     # ---- 2. Which barrier is touched first? --------------------------------
     stop, target = barrier_levels(side, entry_price, atr, cfg)
     last_hold_bar = entry_pos + cfg.max_holding_bars - 1
+    # If we were filled intrabar (price traded *up* to a long trigger), part of
+    # the entry bar happened before we were in the trade. Its low/high extreme
+    # against us most likely printed before the fill, so it cannot be used as
+    # evidence of a stop-out. The close is the only price on that bar known to
+    # come after the fill. A fill at the open means the whole bar is ours.
+    entered_at_open = open_[entry_pos] == entry_price
     for k in range(entry_pos, min(last_hold_bar, n - 1) + 1):
         gap_allowed = k > entry_pos  # an overnight-style gap can only hurt us after entry
+        partial_bar = k == entry_pos and not entered_at_open
         if side > 0:
-            if low[k] <= stop:  # stop checked first: pessimistic tie-break
+            adverse = close[k] if partial_bar else low[k]
+            if adverse <= stop:  # stop checked first: pessimistic tie-break
                 price = min(stop, open_[k]) if gap_allowed else stop
                 return TradePath(OUTCOME_STOP, entry_pos, entry_price, k, price, k)
             if high[k] >= target:
                 return TradePath(OUTCOME_TARGET, entry_pos, entry_price, k, target, k)
         else:
-            if high[k] >= stop:
+            adverse = close[k] if partial_bar else high[k]
+            if adverse >= stop:
                 price = max(stop, open_[k]) if gap_allowed else stop
                 return TradePath(OUTCOME_STOP, entry_pos, entry_price, k, price, k)
             if low[k] <= target:
