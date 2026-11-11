@@ -91,7 +91,7 @@ from core.config import (
     load_settings,
 )
 from core.logging_setup import setup_logging
-from data.fetcher import OHLCV_COLUMNS
+from data.fetcher import FLOW_COLUMNS, OHLCV_COLUMNS
 from execution.broker import (
     STATUS_CANCELED,
     STATUS_FILLED,
@@ -152,14 +152,17 @@ class TradingEngine:
         model,
     ) -> None:
         f = settings.features
-        if f.use_order_flow or f.use_market_context or f.use_regime:
-            # The live feed only supplies plain OHLCV for the traded symbols.
-            # Running a model trained on extra inputs without them would be
-            # train/serve skew, so refuse rather than improvise.
+        if f.use_order_flow and not feed.supports_flow:
+            # A model trained on order-flow inputs cannot be served without
+            # them: that would be train/serve skew, so refuse rather than improvise.
             raise NotImplementedError(
-                "Optional feature groups are research-only: the live engine does not "
-                "yet supply order-flow or context data."
+                "features.use_order_flow is on, but this market feed does not supply "
+                "taker-buy volume and trade counts."
             )
+        self._columns = OHLCV_COLUMNS + (FLOW_COLUMNS if f.use_order_flow else [])
+        # Market-context features need the context symbol's bars even when that
+        # symbol is not traded: it is then streamed as a data-only symbol.
+        self._context_symbol = f.context_symbol if f.use_market_context else None
         self.settings = settings
         self.feed = feed
         self.broker = broker
@@ -169,6 +172,9 @@ class TradingEngine:
         self._timeframe = settings.market.timeframe
         self._bar_td = settings.bar_timedelta
         self._buffer_size = settings.execution.warmup_bars
+        self._stream_symbols = list(self.symbols)
+        if self._context_symbol and self._context_symbol not in self._stream_symbols:
+            self._stream_symbols.append(self._context_symbol)
         self._state = {symbol: SymbolState() for symbol in self.symbols}
         self._buffers: dict[str, pd.DataFrame] = {}
         self._lock = asyncio.Lock()
@@ -185,7 +191,9 @@ class TradingEngine:
             self._install_signal_handlers()
         await self._warm_up()
 
-        workers = [asyncio.create_task(self._run_symbol(s), name=f"bars:{s}") for s in self.symbols]
+        workers = [
+            asyncio.create_task(self._run_symbol(s), name=f"bars:{s}") for s in self._stream_symbols
+        ]
         background = [asyncio.create_task(self._stop.wait(), name="stop")]
         if self.broker.needs_polling:
             background.append(asyncio.create_task(self._reconcile_loop(), name="reconcile"))
@@ -214,12 +222,12 @@ class TradingEngine:
         await self.broker.connect()
         if self.feed is not self.broker:
             await self.feed.connect()
-        for symbol in self.symbols:
-            if self.settings.execution.cancel_orphans_on_start:
+        for symbol in self._stream_symbols:
+            if symbol in self._state and self.settings.execution.cancel_orphans_on_start:
                 # Orders left over from a previous run are not in our state machine.
                 await self.broker.cancel_all_orders(symbol)
             history = await self.feed.fetch_history(symbol, self._timeframe, self._buffer_size)
-            self._buffers[symbol] = history[OHLCV_COLUMNS]
+            self._buffers[symbol] = history[self._columns]
             logger.info("warmed_up", extra={"symbol": symbol, "bars": len(history)})
 
     async def _run_symbol(self, symbol: str) -> None:
@@ -269,7 +277,33 @@ class TradingEngine:
         logger.info("shutdown_complete")
 
     # ============================================================ bar handler
+    def _context_ready(self, timestamp: pd.Timestamp) -> bool:
+        if self._context_symbol is None:
+            return True
+        buffer = self._buffers[self._context_symbol]
+        return len(buffer) > 0 and buffer.index[-1] >= timestamp
+
+    async def _wait_for_context(self, timestamp: pd.Timestamp) -> None:
+        """Give the context symbol's bar for this timestamp a moment to arrive.
+
+        All symbols' bars close at the same instant but are delivered by
+        separate tasks. Features for bar T need the context bar T, so a traded
+        symbol waits briefly for it (outside the lock, so the context task can
+        get in).
+        """
+        deadline = asyncio.get_running_loop().time() + self.settings.execution.context_wait_seconds
+        while not self._context_ready(timestamp) and not self._stop.is_set():
+            if asyncio.get_running_loop().time() >= deadline:
+                return
+            await asyncio.sleep(0.05 if self.broker.needs_polling else 0)
+
     async def _on_bar(self, symbol: str, bar: Bar) -> None:
+        if symbol not in self._state:  # data-only context symbol
+            async with self._lock:
+                await self._append_bar(symbol, bar)
+            return
+        if symbol != self._context_symbol:
+            await self._wait_for_context(bar.timestamp)
         async with self._lock:
             if not await self._append_bar(symbol, bar):
                 return
@@ -306,27 +340,65 @@ class TradingEngine:
             # wrong, so rebuild the buffer from the exchange.
             logger.warning("bar_gap_detected", extra={"symbol": symbol})
             history = await self.feed.fetch_history(symbol, self._timeframe, self._buffer_size)
-            buffer = history[OHLCV_COLUMNS]
+            buffer = history[self._columns]
             buffer = buffer[buffer.index < bar.timestamp]
         row = pd.DataFrame(
-            [[bar.open, bar.high, bar.low, bar.close, bar.volume]],
-            columns=OHLCV_COLUMNS,
+            [[getattr(bar, column) for column in self._columns]],
+            columns=self._columns,
             index=pd.DatetimeIndex([bar.timestamp], name="timestamp"),
         )
         self._buffers[symbol] = pd.concat([buffer, row]).tail(self._buffer_size)
         return True
 
     # ================================================================= entry
-    async def _maybe_enter(self, symbol: str) -> None:
-        """Evaluate the bar that just closed and submit an entry if warranted."""
+    def _score_latest_bar(self, symbol: str) -> tuple[pd.DataFrame, float] | None:
+        """If the newest bar is a setup, return ``(event_row, model_probability)``."""
         buffer = self._buffers[symbol]
-        features = compute_features(buffer, self.settings.features)
+        context = None
+        if self._context_symbol is not None:
+            if not self._context_ready(buffer.index[-1]):
+                # Never score a setup with a stale view of the market.
+                logger.warning("context_not_ready", extra={"symbol": symbol})
+                return None
+            context = self._buffers[self._context_symbol]
+        features = compute_features(buffer, self.settings.features, context=context)
         events = detect_setups(features, self.settings.setup)
         if events.empty or events.index[-1] != buffer.index[-1]:
-            return  # no setup on the latest bar
-
+            return None
         event = events.iloc[[-1]]
         probability = float(self.model.predict_proba(build_feature_matrix(features, event))[0, 1])
+        return event, probability
+
+    async def check(self) -> list[dict]:
+        """Pre-flight check: connect, warm up and score every symbol's latest
+        closed bar. Places no orders. Confirms that data, features and model
+        line up before the engine is left running."""
+        await self._warm_up()
+        report = []
+        for symbol in self.symbols:
+            buffer = self._buffers[symbol]
+            scored = self._score_latest_bar(symbol)
+            row = {
+                "symbol": symbol,
+                "bars": len(buffer),
+                "last_bar": str(buffer.index[-1]),
+                "setup": scored is not None,
+                "probability": round(scored[1], 4) if scored else None,
+            }
+            report.append(row)
+            logger.info("check", extra=row)
+        with contextlib.suppress(Exception):
+            await self.broker.close()
+            if self.feed is not self.broker:
+                await self.feed.close()
+        return report
+
+    async def _maybe_enter(self, symbol: str) -> None:
+        """Evaluate the bar that just closed and submit an entry if warranted."""
+        scored = self._score_latest_bar(symbol)
+        if scored is None:
+            return  # no setup on the latest bar
+        event, probability = scored
         side, atr = int(event["side"].iloc[0]), float(event["atr"].iloc[0])
         log = {"symbol": symbol, "side": side, "probability": round(probability, 4)}
         if probability <= self.settings.model.probability_threshold:
@@ -546,7 +618,7 @@ class TradingEngine:
 # ============================================================================
 # Entry point
 # ============================================================================
-async def _amain(settings: Settings) -> None:
+async def _amain(settings: Settings, check_only: bool = False) -> None:
     from research.train import load_model
 
     model = load_model(settings)  # refuses to load if config no longer matches training
@@ -570,17 +642,26 @@ async def _amain(settings: Settings) -> None:
         "engine_starting",
         extra={"mode": settings.execution.mode, "symbols": settings.market.symbols},
     )
-    await TradingEngine(settings, feed, broker, risk, model).run()
+    engine = TradingEngine(settings, feed, broker, risk, model)
+    if check_only:
+        await engine.check()
+    else:
+        await engine.run()
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the continuation trading engine")
     parser.add_argument("--config", default=None)
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="connect, warm up and score the latest bars, then exit without trading",
+    )
     args = parser.parse_args()
 
     settings = load_settings(args.config)
     setup_logging(settings.execution.log_level, settings.execution.log_json)
-    asyncio.run(_amain(settings))
+    asyncio.run(_amain(settings, check_only=args.check))
 
 
 if __name__ == "__main__":

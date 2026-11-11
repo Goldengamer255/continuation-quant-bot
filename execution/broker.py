@@ -65,7 +65,7 @@ from dataclasses import dataclass
 import pandas as pd
 
 from core.config import CostConfig, Credentials, Settings, timeframe_to_timedelta
-from data.fetcher import ohlcv_to_frame, validate_ohlcv
+from data.fetcher import FLOW_COLUMNS, OHLCV_COLUMNS, ohlcv_to_frame, validate_ohlcv
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +88,9 @@ class Bar:
     low: float
     close: float
     volume: float
+    # Order-flow extras (NaN when the feed does not provide them).
+    taker_buy_volume: float = float("nan")
+    trades: float = float("nan")
 
 
 @dataclass
@@ -122,6 +125,9 @@ def new_client_id() -> str:
 # Interfaces
 # ---------------------------------------------------------------------------
 class MarketFeed(ABC):
+    #: True if bars carry ``taker_buy_volume`` and ``trades`` (order-flow features).
+    supports_flow: bool = False
+
     @abstractmethod
     async def fetch_history(self, symbol: str, timeframe: str, limit: int) -> pd.DataFrame: ...
 
@@ -206,6 +212,11 @@ class CcxtBroker(Broker, MarketFeed):
         self._max_retries = settings.execution.max_retries
         self._base_delay = settings.execution.retry_base_delay
         self.native_bracket = settings.market.type != "spot"
+        # Order-flow columns come from Binance's raw spot kline endpoint.
+        self._with_flow = settings.features.use_order_flow
+        self.supports_flow = settings.market.exchange == "binance" and (
+            settings.market.type == "spot"
+        )
 
         if exchange is not None:  # injected fake for tests
             self._ex = exchange
@@ -360,12 +371,28 @@ class CcxtBroker(Broker, MarketFeed):
         return equity
 
     # ------------------------------------------------------------ market data
-    async def fetch_history(self, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
-        rows = await self._call(
-            "fetch_ohlcv", self._ex.fetch_ohlcv, symbol, timeframe, None, limit + 1
+    async def _raw_klines(self, symbol: str, timeframe: str, limit: int) -> list[list[float]]:
+        """Binance raw klines as ``[ms, o, h, l, c, volume, taker_buy_volume, trades]``."""
+        raw = await self._call(
+            "klines",
+            self._ex.publicGetKlines,
+            {"symbol": self._ex.market(symbol)["id"], "interval": timeframe, "limit": limit},
         )
+        return [[int(k[0]), *(float(v) for v in k[1:6]), float(k[9]), float(k[8])] for k in raw]
+
+    async def fetch_history(self, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
         now = pd.Timestamp(self._ex.milliseconds(), unit="ms", tz="UTC")
-        return validate_ohlcv(ohlcv_to_frame(rows), timeframe, now=now).tail(limit)
+        if self._with_flow:
+            rows = await self._raw_klines(symbol, timeframe, min(limit + 1, 1000))
+            frame = pd.DataFrame(rows, columns=["timestamp", *OHLCV_COLUMNS, *FLOW_COLUMNS])
+            frame["timestamp"] = pd.to_datetime(frame["timestamp"], unit="ms", utc=True)
+            frame = frame.set_index("timestamp").astype("float64")
+        else:
+            rows = await self._call(
+                "fetch_ohlcv", self._ex.fetch_ohlcv, symbol, timeframe, None, limit + 1
+            )
+            frame = ohlcv_to_frame(rows)
+        return validate_ohlcv(frame, timeframe, now=now).tail(limit)
 
     async def stream_closed_bars(self, symbol: str, timeframe: str) -> AsyncIterator[Bar]:
         """Yield closed bars from a websocket, falling back to REST polling.
@@ -375,7 +402,9 @@ class CcxtBroker(Broker, MarketFeed):
         are ignored, so the strategy never sees a half-finished bar.
         """
         bar_ms = int(timeframe_to_timedelta(timeframe).total_seconds() * 1000)
-        use_ws = bool(getattr(self._ex, "has", {}).get("watchOHLCV"))
+        # The websocket candle stream has no taker-buy volume, so order-flow
+        # mode polls the REST kline endpoint once per bar instead.
+        use_ws = bool(getattr(self._ex, "has", {}).get("watchOHLCV")) and not self._with_flow
         last_ts = -1
         while True:
             if use_ws:
@@ -393,15 +422,19 @@ class CcxtBroker(Broker, MarketFeed):
                 now_ms = self._ex.milliseconds()
                 next_close = (now_ms // bar_ms + 1) * bar_ms
                 await asyncio.sleep((next_close - now_ms) / 1000.0 + 2.0)
-                candles = await self._call(
-                    "fetch_ohlcv", self._ex.fetch_ohlcv, symbol, timeframe, None, 5
-                )
+                if self._with_flow:
+                    candles = await self._raw_klines(symbol, timeframe, 5)
+                else:
+                    candles = await self._call(
+                        "fetch_ohlcv", self._ex.fetch_ohlcv, symbol, timeframe, None, 5
+                    )
 
             now_ms = self._ex.milliseconds()
-            for ts, o, h, low, c, v in candles:
+            for candle in candles:
+                ts = int(candle[0])
                 if ts > last_ts and ts + bar_ms <= now_ms:
                     last_ts = ts
-                    yield Bar(pd.Timestamp(ts, unit="ms", tz="UTC"), o, h, low, c, v)
+                    yield Bar(pd.Timestamp(ts, unit="ms", tz="UTC"), *candle[1:])
 
 
 # ---------------------------------------------------------------------------
@@ -579,18 +612,53 @@ class PaperBroker(Broker):
 class ReplayFeed(MarketFeed):
     """Plays historical bars back as if they were arriving live.
 
-    The first ``warmup`` bars are served as history; the rest are streamed
-    one at a time. Lets the full engine run deterministically in a test.
+    Everything before ``start`` is served as history; the rest is streamed
+    one bar at a time. (``warmup`` is the older way to say the same thing by
+    row count.) Lets the full engine run deterministically in a test.
+
+    With several symbols the streams share a **global clock**: a bar stamped T
+    is only released once every other stream has delivered all of its bars
+    before T. Real markets deliver bars in time order; without this, one
+    symbol's task could race years ahead of another's and the engine's shared
+    equity and daily risk limits would be evaluated out of order.
     """
 
-    def __init__(self, bars_by_symbol: dict[str, pd.DataFrame], warmup: int) -> None:
+    def __init__(
+        self,
+        bars_by_symbol: dict[str, pd.DataFrame],
+        warmup: int = 0,
+        start: pd.Timestamp | None = None,
+    ) -> None:
         self._bars = bars_by_symbol
         self._warmup = warmup
+        self._start = start
+        self._pending: dict[str, pd.Timestamp] = {}
+        self.supports_flow = all(
+            set(FLOW_COLUMNS) <= set(frame.columns) for frame in bars_by_symbol.values()
+        )
+
+    def _split(self, symbol: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+        frame = self._bars[symbol]
+        if self._start is not None:
+            return frame[frame.index < self._start], frame[frame.index >= self._start]
+        return frame.iloc[: self._warmup], frame.iloc[self._warmup :]
 
     async def fetch_history(self, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
-        return self._bars[symbol].iloc[: self._warmup].tail(limit)
+        return self._split(symbol)[0].tail(limit)
 
     async def stream_closed_bars(self, symbol: str, timeframe: str) -> AsyncIterator[Bar]:
-        for ts, row in self._bars[symbol].iloc[self._warmup :].iterrows():
-            yield Bar(ts, row["open"], row["high"], row["low"], row["close"], row["volume"])
-            await asyncio.sleep(0)  # hand control back to the event loop, like real I/O would
+        live = self._split(symbol)[1]
+        has_flow = set(FLOW_COLUMNS) <= set(live.columns)
+        try:
+            for ts, row in live.iterrows():
+                self._pending[symbol] = ts
+                # Wait until no other stream still owes an earlier bar.
+                while min(self._pending.values()) < ts:
+                    await asyncio.sleep(0)
+                extras = (row["taker_buy_volume"], row["trades"]) if has_flow else ()
+                yield Bar(
+                    ts, row["open"], row["high"], row["low"], row["close"], row["volume"], *extras
+                )
+                await asyncio.sleep(0)  # hand control back to the event loop, like real I/O
+        finally:
+            self._pending.pop(symbol, None)

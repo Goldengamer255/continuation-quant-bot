@@ -33,8 +33,10 @@ features:
   bb_squeeze_lookback: 100   # history that "normal" Bollinger width is measured over
   ema_fast: 20
   ema_slow: 50
-  # Optional feature groups. Research-only: the live engine refuses to start
-  # with any of them enabled until its data feed supplies the extra inputs.
+  # Optional feature groups (off by default). Order flow needs a feed that
+  # supplies taker-buy volume and trade counts (Binance spot); the engine
+  # refuses to start if the feed cannot. Market context streams
+  # context_symbol as a data-only symbol when it is not traded.
   use_order_flow: false      # taker-buy imbalance, trade size (Binance klines only)
   use_market_context: false  # trend and relative strength vs context_symbol
   use_regime: false          # long trend, volatility regime, time of day/week
@@ -108,6 +110,7 @@ execution:
   mode: paper                # paper | live
   warmup_bars: 600
   reconcile_seconds: 5
+  context_wait_seconds: 30   # how long to wait for the context symbol's bar before skipping entries
   flatten_on_shutdown: false # false = leave the exchange-side protective stop in place
   cancel_orphans_on_start: true
   max_retries: 5

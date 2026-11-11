@@ -83,7 +83,7 @@ class FeatureConfig(_Section):
     bb_squeeze_lookback: int = Field(100, ge=10)
     ema_fast: int = Field(20, ge=2)
     ema_slow: int = Field(50, ge=3)
-    # Optional feature groups (research-only until validated; see features.py).
+    # Optional feature groups (off by default; see features.py).
     use_order_flow: bool = False  # needs taker-buy volume and trade counts (Binance klines)
     use_market_context: bool = False  # needs bars for the context symbol
     use_regime: bool = False
@@ -165,6 +165,7 @@ class ExecutionConfig(_Section):
     mode: Literal["paper", "live"] = "paper"
     warmup_bars: int = Field(600, ge=100)
     reconcile_seconds: float = Field(5.0, gt=0)
+    context_wait_seconds: float = Field(30.0, ge=0)
     flatten_on_shutdown: bool = False
     cancel_orphans_on_start: bool = True
     max_retries: int = Field(5, ge=1)
